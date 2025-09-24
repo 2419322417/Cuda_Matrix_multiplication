@@ -7,8 +7,8 @@
 #include <stdlib.h>
 #include <math.h>
 
-#define TILE_WIDTH 16 
-#define STREAMS 4       
+#define TILE_WIDTH 16
+#define STREAMS 4      
 
 //Kernel函数，执行矩阵乘法
 __global__ void Matrix_MulKernel(int m, int n, int k, float* A, float* B, float* C) {
@@ -32,20 +32,25 @@ __global__ void Matrix_MulKernel_Tiled(int m, int n, int k, float* A, float* B, 
     int Row = blockIdx.y * blockDim.y + threadIdx.y;
     int Col = blockIdx.x * blockDim.x + threadIdx.x;
 
+    int num_tiles = (n + TILE_WIDTH - 1) / TILE_WIDTH;
     float Cvalue = 0.0f;
 
-    for (int t = 0; t < (n - 1) / TILE_WIDTH + 1; ++t) {
+    for (int t = 0; t < num_tiles; ++t) {
         // 加载A的tile
-        if (Row < m && t * TILE_WIDTH + threadIdx.x < n) {
-            ds_A[threadIdx.y][threadIdx.x] = A[Row * n + t * TILE_WIDTH + threadIdx.x];
+        int a_row = Row;
+        int a_col = t * TILE_WIDTH + threadIdx.x;
+        int b_row = t * TILE_WIDTH + threadIdx.y;
+        int b_col = Col;
+        if (a_row < m && a_col < n) {
+            ds_A[threadIdx.y][threadIdx.x] = A[a_row * n + a_col];
         }
         else {
             ds_A[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
-        // 加载B的tile
-        if (t * TILE_WIDTH + threadIdx.y < n && Col < k) {
-            ds_B[threadIdx.y][threadIdx.x] = B[(t * TILE_WIDTH + threadIdx.y) * k + Col];
+        // 加载B的tile (转置加载以实现合并访问)
+        if (b_row < n && b_col < k) {
+            ds_B[threadIdx.y][threadIdx.x] = B[b_row * k + b_col];
         }
         else {
             ds_B[threadIdx.y][threadIdx.x] = 0.0f;
@@ -154,7 +159,7 @@ void Matrix_Mul_Overlapping(int m, int n, int k, float* h_A, float* h_B, float* 
 
     // 只分配一个 d_B
     float* d_B;
-    size_t size_B = n * k * sizeof(float);
+    size_t size_B = (size_t)n * k * sizeof(float);
     cudaMalloc(&d_B, size_B);
     cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice);
 
@@ -163,44 +168,53 @@ void Matrix_Mul_Overlapping(int m, int n, int k, float* h_A, float* h_B, float* 
         int thisRows = rowsPerStream + (i < remainder ? 1 : 0);
         if (thisRows == 0) continue;
 
-        size_t size_A = (size_t)thisRows * (size_t)n * sizeof(float);
-        size_t size_C = (size_t)thisRows * (size_t)k * sizeof(float);
+        size_t size_A = (size_t)thisRows * n * sizeof(float);
+        size_t size_C = (size_t)thisRows * k * sizeof(float);
         cudaMalloc(&d_A[i], size_A);
         cudaMalloc(&d_C[i], size_C);
     }
 
     dim3 threads(TILE_WIDTH, TILE_WIDTH);
 
+    // 第一轮循环：将所有数据传输任务（HtoD）放入各自的流中
     int rowOffset = 0;
     for (int i = 0; i < STREAMS; ++i) {
         int thisRows = rowsPerStream + (i < remainder ? 1 : 0);
         if (thisRows == 0) continue;
-
-        size_t size_A = thisRows * n * sizeof(float);
-        size_t size_C = thisRows * k * sizeof(float);
-
-        // 分配 grid：注意 block 数基于 thisRows
-        dim3 blocks((k + TILE_WIDTH - 1) / TILE_WIDTH, (thisRows + TILE_WIDTH - 1) / TILE_WIDTH);
-
-        // 异步拷贝 A 片段到 device
-        cudaMemcpyAsync(d_A[i], h_A + (size_t)rowOffset * (size_t)n, size_A, cudaMemcpyHostToDevice, streams[i]);
-
-        // kernel：传入 thisRows 作为 m 参数（kernel 内会以 Row < m 做边界检查）
-        Matrix_MulKernel_Tiled <<< blocks, threads, 0, streams[i] >>> (thisRows, n, k, d_A[i], d_B, d_C[i]);
-
-        // 异步拷回 C 片段
-        cudaMemcpyAsync(h_C + (size_t)rowOffset * (size_t)k, d_C[i], size_C, cudaMemcpyDeviceToHost, streams[i]);
-
+        size_t size_A = (size_t)thisRows * n * sizeof(float);
+        cudaMemcpyAsync(d_A[i], h_A + (size_t)rowOffset * n, size_A, cudaMemcpyHostToDevice, streams[i]);
         rowOffset += thisRows;
     }
+
+    // 第二轮循环：将所有计算任务放入各自的流中
+    rowOffset = 0;
+    for (int i = 0; i < STREAMS; ++i) {
+        int thisRows = rowsPerStream + (i < remainder ? 1 : 0);
+        if (thisRows == 0) continue;
+        dim3 blocks((k + TILE_WIDTH - 1) / TILE_WIDTH, (thisRows + TILE_WIDTH - 1) / TILE_WIDTH);
+        Matrix_MulKernel_Tiled << < blocks, threads, 0, streams[i] >> > (thisRows, n, k, d_A[i], d_B, d_C[i]);
+        rowOffset += thisRows;
+    }
+
+    // 第三轮循环：将所有结果传回任务（DtoH）放入各自的流中
+    rowOffset = 0;
+    for (int i = 0; i < STREAMS; ++i) {
+        int thisRows = rowsPerStream + (i < remainder ? 1 : 0);
+        if (thisRows == 0) continue;
+        size_t size_C = (size_t)thisRows * k * sizeof(float);
+        cudaMemcpyAsync(h_C + (size_t)rowOffset * k, d_C[i], size_C, cudaMemcpyDeviceToHost, streams[i]);
+        rowOffset += thisRows;
+    }
+
 
     // 等待所有 stream 完成
     cudaDeviceSynchronize();
 
     // 清理
     for (int i = 0; i < STREAMS; ++i) {
-        cudaFree(d_A[i]);
-        cudaFree(d_C[i]);
+        // 检查指针是否已分配，避免在 thisRows == 0 的情况下出错
+        if (d_A[i]) cudaFree(d_A[i]);
+        if (d_C[i]) cudaFree(d_C[i]);
         cudaStreamDestroy(streams[i]);
     }
     cudaFree(d_B);
@@ -230,9 +244,9 @@ int Compare_Results(int m, int k, float* C_cpu, float* C_gpu) {
 }
 
 int main() {
-    int m = 1024; 
-    int n = 1024; 
-    int k = 1024; 
+    int m = 512; 
+    int n = 512; 
+    int k = 512; 
 
 	//分配主机内存
     size_t size_A = m * n * sizeof(float);
@@ -268,22 +282,21 @@ int main() {
     cudaMemcpy(d_A, h_A, size_A, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice);
     
-    dim3 threadsPerBlock(16, 16);
+    /*dim3 threadsPerBlock(16, 16);
     dim3 numBlocks((k + threadsPerBlock.x - 1) / threadsPerBlock.x,
         (m + threadsPerBlock.y - 1) / threadsPerBlock.y);
-    Matrix_MulKernel <<< numBlocks, threadsPerBlock >>> (m, n, k, d_A, d_B, d_C);
+    Matrix_MulKernel <<< numBlocks, threadsPerBlock >>> (m, n, k, d_A, d_B, d_C);*/
 
-   /* dim3 threadsPerBlock_tiled(TILE_WIDTH, TILE_WIDTH);
+    dim3 threadsPerBlock_tiled(TILE_WIDTH, TILE_WIDTH);
     dim3 numBlocks_tiled((k + TILE_WIDTH - 1) / TILE_WIDTH,
         (m + TILE_WIDTH - 1) / TILE_WIDTH);
     Matrix_MulKernel_Tiled <<< numBlocks_tiled, threadsPerBlock_tiled >>> (m, n, k, d_A, d_B, d_C);
-    Matrix_MulKernel_Tiled_Padding<<<numBlocks_tiled, threadsPerBlock_tiled >>>(m, n, k, d_A, d_B, d_C);
+    /*Matrix_MulKernel_Tiled_Padding<<<numBlocks_tiled, threadsPerBlock_tiled >>>(m, n, k, d_A, d_B, d_C);
     Matrix_MulKernel_RegTiling<<<numBlocks_tiled, threadsPerBlock_tiled>>>(m, n, k, d_A, d_B, d_C);
     Matrix_Mul_Overlapping(m, n, k, h_A, h_B, h_C);*/
 
 	//同步等待GPU完成
     cudaDeviceSynchronize();
-
     cudaMemcpy(h_C, d_C, size_C, cudaMemcpyDeviceToHost);
 
     //printf(" C (m=%d, k=%d):\n", m, k);
@@ -317,9 +330,9 @@ int main() {
 
     //对应pinned释放
 
-    //cudaFreeHost(h_A);
-    //cudaFreeHost(h_B);
-    //cudaFreeHost(h_C);
+    /*cudaFreeHost(h_A);
+    cudaFreeHost(h_B);
+    cudaFreeHost(h_C);*/
 
     return 0;
 }
